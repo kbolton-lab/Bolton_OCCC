@@ -1,0 +1,910 @@
+---
+title: "FinalMutationalLandscape"
+author: "Kelly Bolton"
+date: "4/13/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+R.Version()
+
+library("tidyverse", warn.conflicts = FALSE)
+library("Hmisc", warn.conflicts = FALSE)
+library("table1", warn.conflicts = FALSE)
+library("ggthemr", warn.conflicts = FALSE)
+ggthemr("fresh")
+library("ggpubr", warn.conflicts = FALSE)
+library("patchwork", warn.conflicts = FALSE)
+library("rstatix", warn.conflicts = FALSE)
+library("survminer", warn.conflicts = FALSE)
+library('RColorBrewer', warn.conflicts = FALSE)
+library('ComplexHeatmap', warn.conflicts = FALSE)
+
+source('../utils/fisher_toolbox.R')
+source('../utils/plot_comutation_ggplot.R')
+source("../utils/get_protein_info.R")
+source("../utils/my_lollipop.R")
+
+#library(DESeq2)
+#library(ssh)
+#library(vsn)
+#library(pheatmap)
+#library(stringr)
+#library(ggplot2)
+#library(cowplot)
+#library(ggridges)
+#library(reshape2)
+#library(biomaRt)
+```
+
+## Loading Data
+```{r}
+## oncogenic mutations for patients not pretreated, 
+M <- read.table('processing/masterdf.som.onco.minimum.txt', sep="\t",header = T, stringsAsFactors = F)
+
+## copy number long data
+M.copy <- read.table('processing/masterdf.copynumber.tsv', sep="\t", header = T, stringsAsFactors = F)
+
+# M wide 
+M_wide <- read.table('processing/masterdf_wide_minimum.txt', sep="\t",header = T, stringsAsFactors = F)
+M_wide <- M_wide %>% dplyr::filter(!is.na(site))
+M_with_cell_line <- M
+M <- M %>% dplyr::filter(!is.na(site))
+
+rna <- read.table('processing/RNA.clusters.minimum.txt', sep="\t",header = T, quote = "", stringsAsFactors = F)
+rna_clusters <- rna %>% dplyr::select(mergeid,rnaCluster)
+
+#merge mwide with clusters
+M_wide <- left_join(M_wide,rna_clusters,by="mergeid")
+```
+
+## Table 1
+``` {r}
+D = M_wide 
+
+D$age_range <- factor(D$age_range, levels=c("< 40", "40-50", "50-60", "60-70", "70-80", ">= 80"))
+label(D$age_range) <- "Age(y)"
+D$race <- factor(D$race, levels=c("White", "Asian", "Black", "Other", "Unknown"))
+label(D$race) <- "Race"
+label(D$stage_binary) <- "FIGO Stage"
+D$endom <- factor(D$endom, levels=c("yes", "no", "unknown"))
+label(D$endom) <- "Endometriosis"
+
+t1 <- table1(~ age_range + race + endom + stage_binary | site, data=D)
+t1
+```
+## Figure 1A
+``` {r}
+# Most commonly mutated genes
+gene_list = M %>% dplyr::count(gene) %>% filter(n > 10) %>% arrange(-n) %>% .$gene %>% unique
+
+# tally
+D = M %>% 
+    reshape2::dcast(
+        formula = gene ~ .,
+        value.var = 'TARGET_NAME',
+        fun.aggregate = function(TARGET_NAMEs) {length(unique(TARGET_NAMEs))}
+    ) %>%
+    dplyr::rename("n_patient" = ".") %>%
+    mutate(
+        prop_patient = n_patient/nrow(M_wide)
+    ) %>%
+    filter(gene %in% gene_list) %>%
+    mutate(gene = factor(gene, gene_list)) %>%
+    arrange(prop_patient)
+
+# plot
+prop_gene <- ggplot(
+  D, 
+  aes(x = gene, y = prop_patient)
+  ) +
+geom_bar(stat = 'identity') +
+theme_bw() +
+theme(
+    panel.grid.major = element_blank(), 
+    panel.border = element_blank(),
+    axis.line = element_line(colour = "black"),
+    legend.title = element_blank()
+) +
+ylab("Proportion of Samples with Mutation") +
+xlab("Gene") +
+scale_fill_brewer(palette = 'Dark2', direction = -1) +
+theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+options(repr.plot.width = 10, repr.plot.height = 7, repr.plot.res = 300)
+prop_gene
+```
+
+## Figure 1B
+``` {r}
+# VAF for the top 15 genes
+gene_list = M %>% group_by(gene) %>% summarise(n = n(), median_VAF = median(correct_VAF)) %>% arrange(-n) %>% head(15) %>% arrange(-median_VAF) %>% .$gene
+
+freq_vaf <- ggplot(
+    M %>% filter(gene %in% gene_list) %>% mutate(gene = factor(gene, gene_list)), 
+    aes(x = gene, y = correct_VAF)
+) + geom_boxplot(outlier.alpha = 0) +
+theme_bw() +
+theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_line(colour = "black"),
+    strip.background = element_rect(fill = "white", color = 'white'),
+    legend.title = element_blank()
+) +
+geom_point(pch = 21, size = 0.5, color = 'black') +
+ylab('Varian Allele Frequency') +
+xlab('Gene')
+#ggtitle('VAF by gene - all hit count')
+
+options(repr.plot.width = 10, repr.plot.height = 7, repr.plot.res = 300)
+freq_vaf
+```
+
+## Figure 1C
+``` {r}
+D = M %>% group_by(TARGET_NAME) %>%
+    summarise(
+        mutnum = length(unique(gene))) %>%
+    dplyr::count(mutnum) %>%
+    mutate(total = sum(n)) %>%
+    mutate(prop = n/total) %>% ungroup()
+
+prop_mutnum <- ggplot(
+    D,
+    aes(x = factor(mutnum), y = prop)
+)  + 
+geom_bar(stat = 'identity') +
+theme_bw() +
+geom_text(aes(label = n), size = 3, color = 'black', vjust=-0.3) +
+ylim(0, 0.25) +
+ylab("Proportion of Cases") +
+xlab("Number of Mutated Genes")
+
+options(repr.plot.width = 10, repr.plot.height = 7, repr.plot.res = 300)
+prop_mutnum
+```
+## Figure 1D
+``` {r}
+font_size = 4
+
+p1 = ggdonutchart(
+    data = M %>% dplyr::count(variant_class),
+    x = "n", 
+    fill = "variant_class", 
+    color = "white",
+    lab.pos = "out", 
+    lab.font = c("white", font_size),
+    size = 1) +
+theme(legend.position="right", legend.text = element_text(size=8))+
+scale_fill_discrete(name="Variant Effect")
+
+p2 = ggdonutchart(
+    data = M %>% filter(variant_type == 'SNV') %>% dplyr::count(sub_nuc),
+    x = "n", 
+    fill = "sub_nuc", 
+    color = "white",
+    lab.pos = "out", 
+    lab.font = c("white", font_size),
+    size = 1) +
+theme(legend.position="right", legend.text = element_text(size=8)) +
+scale_fill_discrete(name="Nucleotide Substitution")
+
+options(repr.plot.width = 10, repr.plot.height = 7, repr.plot.res = 300)
+(p1 + p2)
+```
+## Figure 1 Combined
+```{r}
+options(repr.plot.width = 18, repr.plot.height = 10, repr.plot.res = 300)
+(prop_gene + freq_vaf) / (prop_mutnum + (p1 + p2)) 
+```
+## Figure 2A
+``` {r}
+gene_list = M %>% filter(refage<8888) %>% dplyr::count(gene) %>% filter(n > 20) %>% arrange(-n) %>% .$gene %>% unique
+
+D <- M %>% filter(refage<8888) %>% filter(gene %in% gene_list)
+
+# Statistical test
+stat.test <- D %>%
+  t_test(refage ~ gene, ref.group="ARID1A") %>%
+  adjust_pvalue(method="BH") %>%
+  add_significance("p.adj")
+
+stat.test <- stat.test %>% add_xy_position(x = "gene") 
+
+age_gene <- ggplot(
+    D ,
+    aes(x = gene, y = refage)
+) + expand_limits(y=c(20,110)) +
+  geom_violin() + geom_boxplot(width=0.1) + stat_pvalue_manual(stat.test, label = "p.adj", tip.length = 0.01,hide.ns = TRUE) +
+xlab("") + ylab("Age at Diagnosis") + theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+age_gene
+```
+## Figure 2B
+``` {r}
+gene_list = M %>% filter(!is.na(endo_binary)) %>% dplyr::count(gene) %>% filter(n > 20) %>% arrange(-n) %>% .$gene %>% unique
+ddres <- fisher_gene_group(mydata = M_wide,mygenes =gene_list ,group = "endo_binary")
+endo_gene <- fisher_plot_bar(ddres,qval_cutoff = 0.10, col_for_groups = c("#65ADC2", "#233B43"))
+endo_gene_plot <- endo_gene$plot + scale_fill_discrete(name = "History of Endometriosis", labels = c("No", "Yes")) + ylab("Percentage with Mutation") + xlab("")
+endo_gene_plot
+```
+## Figure 2C
+``` {r}
+gene_list = M %>% filter(!is.na(stage_binary)) %>% dplyr::count(gene) %>% filter(n > 20) %>% arrange(-n) %>% .$gene %>% unique
+
+D <- M_wide %>% mutate(stage_bini=case_when(
+                           stage_binary == 'I/II'~ 0,
+                           stage_binary == 'III/IV' ~ 1 ))
+                         
+ddres <- fisher_gene_group(mydata = D,mygenes =gene_list ,group = "stage_bini")
+stage_gene <- fisher_plot_bar(ddres, col_for_groups = c("#65ADC2", "#233B43"))
+stage_gene_plot <- stage_gene$plot + scale_fill_discrete(name = "FIGO Tumor Stage", labels = c("I/II", "III/IV")) + ylab("Frequency") + xlab("")
+stage_gene_plot
+```
+## Figure 2D
+``` {r}
+gene_list = M %>% filter(asian!="unknown") %>% dplyr::count(gene) %>% filter(n > 20) %>% arrange(-n) %>% .$gene %>% unique
+D <- M_wide %>% mutate(Asian=case_when(
+                asian=="yes" ~ 1,
+                asian=="no" ~ 0))
+ddres <- fisher_gene_group(mydata = D,mygenes =gene_list ,group = "Asian")
+asian_gene <- fisher_plot_bar(ddres, qval_cutoff = 0.10, col_for_groups = c("#65ADC2", "#233B43"))
+asian_gene_plot <- asian_gene$plot + scale_fill_discrete(name = "Asian Ancestry", labels = c("No", "Yes")) + ylab("Frequency") + xlab("")
+
+asian_gene_plot
+```
+
+## Figure 2 Combined
+``` {r}
+(age_gene | endo_gene_plot) /
+(stage_gene_plot | asian_gene_plot) + plot_annotation(tag_levels = 'A')
+```
+
+## Figure 3 - 
+``` {r}
+.ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+bm <- getBM(attributes = c('ensembl_gene_id', 'external_gene_name', 'gene_biotype'), mart = .ensembl)
+
+### reading the raw data
+masterdf_wide <- read.table(file = 'processing/masterdf_wide.tsv', header = T, sep = '\t')
+masterdf_wide$site <- factor(x = masterdf_wide$site, levels = unique(sort(masterdf_wide$site)))
+masterdf_wide.2 <- masterdf_wide[,143:152]
+#SampleSheet <- read.table(file = 'data/SampleSheet.csv', header = T, sep = ',')
+#typecounts <- read.table(file = 'data/typecounts.txt', header = T, sep = '\t', quote = '')
+```
+
+## Figure 4 - Data Preparation
+``` {r}
+#Prepare data
+D_surv <- M_wide %>% filter(has_leukgen_data == TRUE) %>%
+mutate(vitalstatus=ifelse(vitalstatus=="unknown","alive",vitalstatus)) %>%
+mutate(timerec=ifelse(timerec==8888 | is.na(timerec),0,timerec)) %>%
+mutate(timerec=ifelse(timerec<0,0,timerec)) %>% 
+mutate(vitalstatus_bin = ifelse(vitalstatus == 'dead',1, 0)) %>%
+filter(timelastfu!=8888)
+
+D_surv <- D_surv %>% mutate(resdx_bin=case_when(
+            (resdx=="macroscopic disease <=1 cm" | resdx=="no macroscopic disease") ~ "noresdx",
+            (resdx=="Macroscopic disease >1cm" | resdx=="macroscopic disease >1cm and <=2cm" | resdx=="macroscopic disease, size unknown") ~ "resdx",
+             TRUE ~ "UK"))
+
+D_surv <- D_surv %>% mutate(stage_binary=ifelse(is.na(stage_binary),"Unknown", stage_binary))
+
+D_surv <- D_surv %>% mutate(cont=case_when(
+                (site=="ADD" | site=="SCOT") ~ "UK",
+                site=="WMH" ~ "WHM",
+                TRUE ~ "US"
+))
+
+D_surv <- D_surv %>% mutate(race2=case_when(
+  race=="1" ~ "White",
+  race=="Presumed white" ~ "White",
+  race=="Unknown" | race=="Other" ~ "Other_UK",
+    TRUE ~ race
+))
+D_surv <- D_surv %>% mutate(race2=factor(race2, levels=c("White", "Asian", "Black", "Other", "Unknown")))
+
+################
+# Right censor #
+################
+# where yearstoentry is the time from being at risk of event (e.g diagnosis and risk of death) to time to study entry.  This allows for left truncation and inclusion of prevalent cases in analysis.
+# yearstostatus is time from being at risk to time of censoring (death or end of follow up)
+
+time <- 5  # Censoring time
+D_surv <- D_surv %>% mutate(yearstoentry = timerec / 365) %>% 
+                 mutate(yearstostatus = timelastfu / 365)
+D_surv <- filter(D_surv, yearstostatus>yearstoentry)
+D_surv <- mutate(D_surv, vitalstatus_bin = ifelse(yearstostatus>time, 0, vitalstatus_bin), 
+                 yearstostatus = ifelse(yearstostatus>time, time, yearstostatus))
+
+# Create Survival Objects
+x <- with(D_surv, Surv(yearstoentry, yearstostatus, vitalstatus_bin))
+z <- with(D_surv, Surv(yearstostatus, vitalstatus_bin)) # Ignore left truncation of the data
+```
+
+## Figure 4A
+``` {r}
+D <- D_surv %>% mutate(TP53_ARID1A=case_when(
+                  ARID1A==1 ~ "ARID1Am",
+                  TP53==1 ~ "ARID1Aw_TP53m"))
+D <- D %>% mutate(TP53_ARID1A=relevel(factor(TP53_ARID1A), ref ="ARID1Am"))
+
+km_fit <- survfit(x ~ TP53_ARID1A, data=D) 
+km_fit2 <- survfit(z ~ TP53_ARID1A, data=D) 
+
+# Edit left_truncated KM curve
+km_fit$call <- km_fit2$call
+
+pA <- ggsurvplot(
+  km_fit, 
+  data = D,
+  size = 1,                 # change line size
+  conf.int = FALSE,          # Add confidence interval
+  risk.table = TRUE,        # Add risk table
+  conf.int.alpha = 0.1,
+  risk.table.col = "strata",# Risk table color by groups
+  risk.table.height = 0.3,
+  legend.labs = c("ARID1Am", "ARID1Awt/TP53m")
+  ) + xlab("Years")
+options(repr.plot.width = 15, repr.plot.height = 7, repr.plot.res = 300)
+pA
+```
+
+## Figure 4B
+``` {r}
+D <- D_surv %>% mutate(rnaCluster=case_when(
+    rnaCluster == 1 ~ "Cluster 1",
+    rnaCluster == 2 ~ "Cluster 2"))
+D <- D %>% mutate(rnaCluster=relevel(factor(rnaCluster), ref ="Cluster 1"))
+
+km_fit <- survfit(x ~ rnaCluster, data=D) 
+km_fit2 <- survfit(z ~ rnaCluster, data=D) 
+
+# Edit left_truncated KM curve
+km_fit$call <- km_fit2$call
+
+pB<-ggsurvplot(
+  km_fit, 
+  data = D,
+  size = 1,                 # change line size
+  conf.int = FALSE,          # Add confidence interval
+  risk.table = TRUE,        # Add risk table
+  conf.int.alpha = 0.1,
+  risk.table.col = "strata",# Risk table color by groups
+  risk.table.height = 0.3,
+  legend.labs = c("RNA Cluster 1", "RNA Cluster 2")
+  ) + xlab("Years")
+# #  legend.labs = levels(D$ARID1A_state_det)) # Useful to change when you have multiple groups
+options(repr.plot.width = 15, repr.plot.height = 7, repr.plot.res = 300)
+pB
+```
+## Figure 4
+``` {r}
+options(repr.plot.width = 10, repr.plot.height = 7, repr.plot.res = 300)
+Fig4a <- pA$plot
+Fig4a_t <- pA$table
+Fig4b <- pB$plot
+Fig4b_t <- pB$table
+(Fig4a + Fig4b) / (Fig4a_t + Fig4b_t) + plot_layout(heights = c(10, 10, 2, 2))
+```
+## Supplementary Figure 1 - Arm/Chromosome Level Alterations
+```{r}
+gene_list = M.copy %>% dplyr::count(VAG_GENE) %>% filter(n > 25) %>% arrange(-n) %>% .$VAG_GENE %>% unique %>% gsub("^chr.", "", .)
+
+# tally
+D = M.copy %>% mutate(VAG_GENE=gsub("^chr.", "", VAG_GENE)) %>%
+    reshape2::dcast(
+        formula = VAG_GENE ~ .,
+        value.var = 'TARGET_NAME',
+        fun.aggregate = function(TARGET_NAMEs) {length(unique(TARGET_NAMEs))}
+    ) %>%
+    dplyr::rename("n_patient" = ".") %>%
+    mutate(
+        prop_patient = n_patient/nrow(M_wide)
+    ) %>%
+    filter(VAG_GENE %in% gene_list) %>%
+    mutate(VAG_GENE = factor(VAG_GENE, gene_list)) %>%
+    arrange(VAG_GENE)
+
+# plot
+cne <- ggplot(
+    D,
+    aes(x = VAG_GENE, y = prop_patient)
+) +
+geom_bar(stat = 'identity') +
+theme_bw() +
+theme(
+    panel.grid.major = element_blank(), 
+    panel.border = element_blank(),
+    axis.line = element_line(colour = "black"),
+    legend.title = element_blank()
+) +
+scale_fill_brewer(palette = 'Dark2', direction = -1) +
+theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ylab("Proportion of Cases with Event") + xlab("")
+
+options(repr.plot.width = 10, repr.plot.height = 7, repr.plot.res = 300)
+cne
+```
+
+## Supplementary Figure 2 - Number of Aneuplodies and Mutation
+```{r}
+options(repr.plot.width = 10, repr.plot.height = 8, repr.plot.res = 300)
+
+gene_list = M %>% dplyr::count(gene) %>% filter(n > 20) %>% arrange(-n) %>% .$gene %>% unique
+
+D <- M %>% filter(gene %in% gene_list)
+copynum <- M_wide %>% dplyr::select(mutnum_copy,TARGET_NAME)
+D <- left_join(D,copynum,by="TARGET_NAME")
+
+# Statistical test
+stat.test <- D %>%
+  t_test(mutnum_copy ~ gene, ref.group="ARID1A") %>%
+  adjust_pvalue(method="BH") %>%
+  add_significance("p.adj")
+
+stat.test <- stat.test %>% add_xy_position(x = "gene") 
+
+nam <- ggplot(
+    D ,
+    aes(x = gene, y = mutnum_copy)
+) + 
+  geom_violin() + geom_boxplot(width=0.1) + ylab("Number of Aneuploidies") + xlab("Gene") + 
+stat_pvalue_manual(stat.test, label = "p.adj", tip.length = 0.01,hide.ns = TRUE)
+nam
+```
+
+## Supplementary Figure 3 - Fusions
+```{r}
+D_rna <- filter(M_wide, has_rna==1)
+
+D = M_with_cell_line %>% filter(variant_class=="fusion") %>% filter(!is.na(gene))
+
+gene_list = D %>% count(gene) %>% arrange(-n) %>% .$gene %>% unique
+
+# tally
+D2 <- D %>%
+    reshape2::dcast(
+        formula = gene ~ .,
+        value.var = 'TARGET_NAME',
+        fun.aggregate = function(TARGET_NAMEs) {length(unique(TARGET_NAMEs))}
+    ) %>%
+    dplyr::rename("n_patient" = ".") %>%
+    mutate(
+        prop_patient = n_patient/nrow(D_rna)
+    ) %>%
+    mutate(gene = factor(gene, gene_list)) %>%
+    arrange(gene)
+
+# plot
+fus <- ggplot(
+    D2,
+    aes(x = gene, y = prop_patient)
+) +
+geom_bar(stat = 'identity') +
+theme_bw() +
+theme(
+    panel.grid.major = element_blank(), 
+    panel.border = element_blank(),
+    axis.line = element_line(colour = "black"),
+    legend.title = element_blank()
+) +
+scale_fill_brewer(palette = 'Dark2', direction = -1) +
+theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab("Proportion of Cases with Event") +
+  xlab("Fusion Gene")
+fus
+```
+
+## Supplementary Figure 4 - Number of mutations among those with mutations in specific gene (each sample counted only once)
+``` {r}
+gene_list = M %>% dplyr::count(gene, pre_tx) %>% group_by(gene) %>%
+    filter(sum(n) > 10 & length(n) > 1) %>% arrange(-n) %>% .$gene %>% unique
+
+D = M %>% group_by(gene, TARGET_NAME) %>% 
+    mutate(mutnum = n()) %>% 
+    mutate(mutnum = case_when(
+        mutnum == 1 ~ '1',
+        mutnum == 2 ~ '2',
+        mutnum == 3 ~ '3',
+        T ~ '4+'
+    )) %>% ungroup() %>%
+    filter(gene %in% gene_list) %>%
+    dplyr::count(gene, mutnum) %>%
+    group_by(gene) %>%
+    mutate(total = sum(n), prop = n/sum(n)) %>%
+    group_by(gene) %>%
+    mutate(prop1 = sum(prop[mutnum == '1'])) %>%
+    arrange(prop1) %>% 
+    ungroup() %>%
+    mutate(
+        gene = factor(gene, unique(gene))
+    )
+
+prop_mut_per_sample <- ggplot(
+        D,
+        aes(x = gene, y = prop, fill = mutnum)
+    ) +
+    geom_bar(stat = 'identity') +
+    geom_text(aes(label = n), size = 3, position = position_stack(vjust = 0.5), color = 'white') +
+    theme_bw() +
+    theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black"),
+        strip.background = element_rect(fill = "white", color = 'white')
+    ) +
+    ggtitle('Number of Mutations Within Gene') +
+    theme(
+        plot.title = element_text(hjust = 0.5),
+        legend.position = 'left',
+        strip.text = element_text(size = 8)
+    ) + labs(fill = "Number of\nmutations\nwithin same\ngene per\nsample") +
+  xlab("Gene") + ylab("Proportion")
+
+options(repr.plot.width = 12, repr.plot.height = 8, repr.plot.res = 300)
+prop_mut_per_sample
+```
+
+## Supplementary Figure 5
+``` {r}
+# Clean up format of the dataframe
+# ================================================================================================================
+D = M %>% 
+    mutate(
+        ID = TARGET_NAME,
+        PROTEIN_POS = gsub("^...(\\d*)\\D.*","\\1", VAG_PROTEIN_CHANGE) %>% as.integer(),
+        PROTEIN_CHANGE = VAG_PROTEIN_CHANGE,
+        mutation_type = variant_class) %>%
+        mutate(PROTEIN_POS = ifelse(gene == 'TERT' & mutation_type == 'Promoter' & is.na(PROTEIN_POS), 170 - (START%%1000)%/% 3 , PROTEIN_POS), 
+               PROTEIN_CHANGE = ifelse(gene == 'TERT' & mutation_type == 'Promoter', paste0(REF, PROTEIN_POS, ALT), PROTEIN_POS))
+
+# Plotting
+# ================================================================================================================
+
+colors.mutation_type <- brewer.pal(8,"Dark2")[1:7]
+names(colors.mutation_type) <- c("Frameshift indel", "Inframe indel", "Splice or other", "5_prime_UTR_variant", 'Promoter','Nonsense','Missense')
+
+# Lollipop plots
+cutoff.hotspot = 20
+    
+# a. Recover protein
+prot.info = get_protein_info("PIK3CA")
+    
+# b. Plot 
+print("making the plot now!")
+pp = my_lollipop(dat.genetics.unique=D, 
+                 current.gene="PIK3CA", 
+                 protein_domain=prot.info$protein_domain, 
+                 protein_length=prot.info$protein_length, 
+                 diseases=hit,
+                 cutoff.hotspot = cutoff.hotspot,
+                 colors.mutation_type=colors.mutation_type)
+    
+    plot(pp)
+```
+
+## Supplementary Figure 6a
+``` {r}
+D <- M_wide %>% mutate(mutnum_mut_2=ifelse(mutnum_mut>=10,10,mutnum_mut))
+
+D <- D %>% mutate(mutnum_mut_2=relevel(factor(mutnum_mut_2), ref= "0"))
+#D <- D %>% mutate(mutnum_mut_2=ifelse(mutnum_mut_2=="10",">10",mutnum_mut_2))
+
+ts1<-ggplot(D, aes(x=mutnum_mut_2, y=MSI)) + 
+  geom_boxplot() + labs(x="Number of Mutations")
+ts1
+```
+
+## Supplementary Figure 6b
+```{r}
+gene_list = M %>% dplyr::count(gene) %>% filter(n > 7) %>% .$gene %>% unique
+
+D <- M %>% filter(gene %in% gene_list) %>% group_by(gene) %>% mutate(avg_msi=median(MSI)) %>%
+            arrange(-avg_msi) %>% ungroup() %>% mutate(gene=factor(gene,unique(gene)))
+ts2<-ggplot(D,
+    aes(x = gene, y =MSI)
+) + 
+geom_boxplot(mapping = aes(x = gene), position = 'dodge', outlier.alpha = 0) +
+geom_point(pch = 21, size = 1, color = 'black') + theme(axis.text.x = element_text(angle = 45, vjust = 0.5)) + xlab("Gene")
+ts2
+```
+
+## Supplementary Figure 6 Combined
+```{r}
+options(repr.plot.width = 10, repr.plot.height = 7, repr.plot.res = 300)
+(ts1 + ts2) + plot_layout(widths = c(1, 2)) + plot_annotation(tag_levels = 'A')
+```
+
+## Supplementary Figure 7
+``` {r}
+gene_list <- c("ARID1A",
+               "PTEN",
+               "PIK3CA",
+               "TP53", 
+               "PIK3R1",
+                "TERT", "KRAS", "CREBBP", "SPOP", "KMT2C","ARID1B","ATM","CHD4","SMARCA4","CTNNB1","CTNNB1","KMT2D","BRCA1","TET2","BRCA2","FBXW7","ERBB3","PMS2","SPEN","CUX1")
+genefusionlist <- c("UBAP2","ITCH", "BCAR4", "ASIP", "LAMC1","VMP1","TGM7", "DCAF12")
+
+D <- M_wide %>% dplyr::select(-dplyr::one_of(genefusionlist)) 
+D <- D %>% dplyr::select(one_of(gene_list))
+
+mut <- D %>%  
+   dplyr::select(ARID1A:CUX1) %>%
+    select_if(
+        function(x) {sum(x) > 5}
+    ) 
+suppressWarnings(plot_comutation(dat.integrate = mut, cache = F, Reordering = NULL))
+```
+
+## Supplementary Figure 8
+``` {r}
+D <- left_join(M, M_wide, by=c("TARGET_NAME"="TARGET_NAME"))
+
+# Clusters are:
+# - ARID1As_DD
+# - ARID1As_misc
+# - ARID1Am_PIK
+# - SMARCA4
+# - TP53_noARID1ASMARC
+# - noARID1A_DD
+# - ARID1Am_wPIK
+# - Undefined
+
+M_matrix_multi <- D %>%
+  group_by(TARGET_NAME, gene, cluster) %>%
+  summarise(n = n(), variant_conc = ifelse(n ==1, gsub('5_', '', gsub(" ", "_", variant_class)), 'Multi_mutation')) %>% 
+  arrange(cluster) %>%
+  reshape2::dcast(formula = gene ~ TARGET_NAME,
+                  value.var = 'variant_conc')
+
+cluster<-D %>% group_by(TARGET_NAME, cluster) %>% summarise(n = n())
+
+gene_list = D %>% group_by(TARGET_NAME, gene, cluster) %>% summarise(mut_gene = n()) %>% ungroup() %>% dplyr::count(gene) %>% filter(n>10) %>% arrange(-n) %>% .$gene %>% unique
+
+mat <- M_matrix_multi %>% filter(gene %in% gene_list)
+mat[is.na(mat)] = ""
+rownames(mat) = mat[,1]
+mat = mat[,-1]
+mat = as.matrix(mat)
+
+col = c("Frameshift_indel" = "blue", "Inframe_indel" = "#448EFB", "Splice_or_other" = "purple", "prime_UTR_variant" = "#008000", 'Promoter' = 'yellow', 'Nonsense'="#B0FFB0",'Missense' = 'orange', "Multi_mutation" = "red", 'fusion' = 'black')
+alter_fun = list(
+  background = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(0.8, "mm"), h-unit(0.5, "mm"), 
+              gp = gpar(fill = "#CCCCCC", col = NA))
+  },
+  # big blue
+  Frameshift_indel = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(0.8, "mm"), h-unit(0.5, "mm"), 
+              gp = gpar(fill = col["Frameshift_indel"], col = NA))
+  },
+  # bug red
+  Inframe_indel = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(0.8, "mm"), h-unit(0.5, "mm"), 
+              gp = gpar(fill = col["Inframe_indel"], col = NA))
+  },
+  # small green
+  Splice_or_other = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(0.8, "mm"), h-unit(0.5, "mm"), 
+              gp = gpar(fill = col["Splice_or_other"], col = NA))
+  },
+  prime_UTR_variant = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(0.8, "mm"), h-unit(0.5, "mm"), 
+              gp = gpar(fill = col["prime_UTR_variant"], col = NA))
+  },
+  Promoter = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(0.8, "mm"), h-unit(0.5, "mm"), 
+              gp = gpar(fill = col["Promoter"], col = NA))
+  },
+  Nonsense = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(0.8, "mm"), h-unit(0.5, "mm"), 
+              gp = gpar(fill = col["Nonsense"], col = NA))
+  },
+  Missense = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(0.8, "mm"), h-unit(0.5, "mm"), 
+              gp = gpar(fill = col["Missense"], col = NA))
+  },
+  # big green
+  Multi_mutation = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(0.8, "mm"), h-unit(0.5, "mm"), 
+              gp = gpar(fill = col["Multi_mutation"], col = NA))
+  },
+  # black
+  Fusion = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(0.8, "mm"), h-unit(0.5, "mm"),
+              gp = gpar(fill = col["fusion"], col = NA))
+  }
+)
+
+sample_list = D %>% mutate(gene = relevel(as.factor(gene),'ARID1A')) %>% group_by(TARGET_NAME, gene, cluster) %>%
+  summarise(n = n(), variant_conc = ifelse(n ==1, gsub('5_', '', gsub(" ", "_", variant_class)), 'Multi_mutation')) %>%
+  arrange(cluster, gene, variant_conc) %>% .$TARGET_NAME %>% unique
+
+# _4. plot ----------------------------------------------------------------
+# The get_type function is import to split up multiple mutations in 1 cell
+
+p_onco<-oncoPrint(mat, get_type = function(x) gsub(":.*$", "", strsplit(x, ";")[[1]]),
+        alter_fun = alter_fun, col = col, row_order = gene_list, column_order = sample_list,
+        column_title = "", column_title_side = "bottom", column_title_rot = 90, column_title_gp = gpar(fontsize = 10), column_split = cluster$cluster, remove_empty_columns = T) 
+p_onco  
+```
+
+## Supplementary Figure 9a
+``` {r}
+D <- M_wide %>% filter(refage<8888) %>% mutate(cluster_r=case_when(
+    cluster=="ARID1Am_PIK" ~ "Multiple ARID1Am+PIK3CAm",
+    cluster=="ARID1Am_wPIK" ~ "Multiple ARID1Am+PIK3CAwt",
+    cluster=="ARID1As_misc" ~ "Single ARID1Am",
+    cluster=="ARID1As_DD" ~ "Single ARID1Am+Other DD",
+    cluster=="noARID1A_DD" ~ "ARID1Awt/TP53wt",
+    cluster=="SMARCA4" ~ "SMARCA4m",
+    cluster=="TP53_noARID1ASMARC" ~ "TP53m/ARID1Awt",
+    TRUE ~ cluster
+    ))
+
+# Statistical test
+stat.test <- D %>%
+  t_test(refage ~ cluster_r, ref.group="Single ARID1Am+Other DD") %>%
+  adjust_pvalue(method="BH") %>%
+  add_significance("p.adj")
+
+stat.test <- stat.test %>% add_xy_position(x = "cluster") 
+
+D$cluster_r <- factor(D$cluster_r , levels = c("Multiple ARID1Am+PIK3CAm", "Multiple ARID1Am+PIK3CAwt", "Single ARID1Am+Other DD", "Single ARID1Am", "ARID1Awt/TP53wt", "SMARCA4m", "TP53m/ARID1Awt", "Undefined"))
+
+options(repr.plot.width = 10, repr.plot.height = 7, repr.plot.res = 300)
+q <- ggplot(
+    D ,
+    aes(x = cluster_r, y = refage)
+) + 
+  geom_violin() + geom_boxplot(width=0.1) + stat_pvalue_manual(stat.test, label = "p.adj", tip.length = 0.01,hide.ns = TRUE) + ylab("Age at Diagnosis") + xlab("")
+
+supp9a <- q + theme(axis.text.x=element_text(angle=60,hjust=1))
+supp9a
+```
+
+## Supplementary Figure 9b
+``` {r}
+D <- M_wide %>% mutate(stage_bini=case_when(
+                           stage_binary == 'I/II'~ 0,
+                           stage_binary == 'III/IV' ~ 1 ))
+
+D <- D %>% mutate(`mARID1Am+PIK3CAm`=ifelse(cluster=="ARID1Am_PIK",1,0),
+                      `mARID1Am+PIK3CAwt`=ifelse(cluster=="ARID1Am_wPIK",1,0),
+                      `sARID1Am/Other DD`=ifelse(cluster=="ARID1As_DD",1,0),
+                      sARID1Am=ifelse(cluster=="ARID1As_misc",1,0),
+                      `ARID1Awt+TP53wt`=ifelse(cluster=="noARID1A_DD",1,0),
+                      SMARCA4m=ifelse(cluster=="SMARCA4",1,0),
+                      `TP53m+ARID1Awt`=ifelse(cluster=="TP53_noARID1ASMARC",1,0),
+                      Undefined=ifelse(cluster=="Undefined",1,0))
+
+cluster_list = c("mARID1Am+PIK3CAm","mARID1Am+PIK3CAwt","sARID1Am/Other DD","sARID1Am","ARID1Awt+TP53wt","SMARCA4m","TP53m+ARID1Awt","Undefined")
+
+ddres <- fisher_gene_group(mydata = D,mygenes =cluster_list ,group = "stage_bini")
+ddres <- ddres %>% dplyr::rename(`I/II` = `X0`, `III/IV` = `X1`)
+p <- fisher_plot_bar(ddres, col_for_groups = c("#66a4b2", "#223438"))
+supp9b <- p$plot +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.title.y = element_blank(),
+        strip.background = element_rect(fill = "white", color = 'white')) + labs(fill = "FIGO Tumor Stage") 
+supp9b 
+```
+
+## Supplementary Figure 9c
+``` {r}
+D <- M_wide %>% mutate(`mARID1Am+PIK3CAm`=ifelse(cluster=="ARID1Am_PIK",1,0),
+                      `mARID1Am+PIK3CAwt`=ifelse(cluster=="ARID1Am_wPIK",1,0),
+                      `sARID1Am/Other DD`=ifelse(cluster=="ARID1As_DD",1,0),
+                      sARID1Am=ifelse(cluster=="ARID1As_misc",1,0),
+                      `ARID1Awt+TP53wt`=ifelse(cluster=="noARID1A_DD",1,0),
+                      SMARCA4m=ifelse(cluster=="SMARCA4",1,0),
+                      `TP53m+ARID1Awt`=ifelse(cluster=="TP53_noARID1ASMARC",1,0),
+                      Undefined=ifelse(cluster=="Undefined",1,0))
+
+cluster_list = c("mARID1Am+PIK3CAm","mARID1Am+PIK3CAwt","sARID1Am/Other DD","sARID1Am","ARID1Awt+TP53wt","SMARCA4m","TP53m+ARID1Awt","Undefined")
+
+ddres <- fisher_gene_group(mydata = D,mygenes =cluster_list ,group = "endo_binary")
+ddres <- ddres %>% dplyr::rename(No = `X0`, Yes = `X1`)
+p <- fisher_plot_bar(ddres, qval_cutoff = 0.10, col_for_groups = c("#66a4b2", "#223438"))
+supp9c <- p$plot + theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.title.y = element_blank(),
+        strip.background = element_rect(fill = "white", color = 'white')) + labs(fill = "History of Endometriosis") 
+supp9c 
+```
+
+## Supplementary Figure 9d
+``` {r}
+D <- M_wide %>% mutate(Asian=case_when(
+                asian=="yes" ~ 1,
+                asian=="no" ~ 0))
+
+D <- D %>% mutate(`mARID1Am+PIK3CAm`=ifelse(cluster=="ARID1Am_PIK",1,0),
+                      `mARID1Am+PIK3CAwt`=ifelse(cluster=="ARID1Am_wPIK",1,0),
+                      `sARID1Am/Other DD`=ifelse(cluster=="ARID1As_DD",1,0),
+                      sARID1Am=ifelse(cluster=="ARID1As_misc",1,0),
+                      `ARID1Awt+TP53wt`=ifelse(cluster=="noARID1A_DD",1,0),
+                      SMARCA4m=ifelse(cluster=="SMARCA4",1,0),
+                      `TP53m+ARID1Awt`=ifelse(cluster=="TP53_noARID1ASMARC",1,0),
+                      Undefined=ifelse(cluster=="Undefined",1,0))
+
+cluster_list = c("mARID1Am+PIK3CAm","mARID1Am+PIK3CAwt","sARID1Am/Other DD","sARID1Am","ARID1Awt+TP53wt","SMARCA4m","TP53m+ARID1Awt","Undefined")
+
+ddres <- fisher_gene_group(mydata = D,mygenes =cluster_list ,group = "Asian")
+ddres <- ddres %>% dplyr::rename(No = `X0`, Yes = `X1`)
+p <- fisher_plot_bar(ddres, qval_cutoff = 0.10, col_for_groups = c("#66a4b2", "#223438"))
+supp9d <- p$plot + theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.title.y = element_blank(),
+        strip.background = element_rect(fill = "white", color = 'white')) + labs(fill = "Asian Ancestry") 
+supp9d 
+```
+## Supplementary Figure 9 Combined
+```{r}
+(supp9a + supp9b) / (supp9c + supp9d)
+```
+
+## Save Files
+``` {r}
+# EPS, TIFF, PNG, no JPEG
+# PNG is better for Screens, TIFF is better for printing, JPEG compression algorithm ruins the picture
+
+(prop_gene + freq_vaf) / (prop_mutnum + (p1 + p2))
+ggsave("Figure1.png", width = 14, height = 10, dpi = 300)
+dev.off()
+
+(age_gene | endo_gene_plot) /
+(stage_gene_plot | asian_gene_plot) + plot_annotation(tag_levels = 'A')
+ggsave("Figure2.png", width=12, height=6, dpi=300)
+dev.off()
+
+(pA$plot | pB$plot) /
+(pA$table | pB$table) + plot_layout(heights = c(5,1))
+ggsave("Figure4.png", width=14, height=6, dpi=300)
+dev.off()
+
+(cne)
+ggsave("SuppFig1.png", width=12, height=6, dpi=300)
+dev.off()
+
+(nam)
+ggsave("SuppFig2.png", width=12, height=6, dpi=300)
+dev.off()
+
+(fus)
+ggsave("SuppFig3.png", width=12, height=6, dpi=300)
+dev.off()
+
+(prop_mut_per_sample)
+ggsave("SuppFig4.png", width=12, height=6, dpi=300)
+dev.off()
+
+(ts1 + ts2) + plot_layout(widths = c(1, 2)) + plot_annotation(tag_levels = 'A')
+ggsave("SuppFig6.png", width = 12, height = 6, dpi = 300)
+dev.off()
+
+suppressWarnings(plot_comutation(dat.integrate = mut, cache = F, Reordering = NULL))
+ggsave("SuppFig7.png", width = 12, height = 12, dpi = 300)
+dev.off()
+
+pdf('SuppFig8.pdf', width = 10, height = 6)
+print(p_onco)
+dev.off()
+
+(supp9a + supp9b) / (supp9c + supp9d)
+ggsave("SuppFig9.png", width=14, height=6, dpi=300)
+dev.off()
+```
